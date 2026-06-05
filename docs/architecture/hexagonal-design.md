@@ -271,3 +271,182 @@ await server.run()
 5. **最小实现可行**：VAD + ASR + LLM + TTS 四端口 + 默认 pipeline 能描述一个可启动的最小服务端。
 
 > 进入实现阶段后，端到端验证可用 `test/test_page.html`（谷歌浏览器连 `ws://<ip>:8000/xiaozhi/v1/`）跑一轮完整语音对话，比对新旧版本的出站消息序列与音频帧节奏（60ms）。
+
+---
+
+## 七、高级能力与横切关注点
+
+前六节给出主链路与端口骨架。但把抽象做"通用"，最易漏的是这些**横切关注点**：视觉、上下文构建、跨阶段的高级元数据（情绪/语速/语言/说话人）、工具的静态与动态注册。本节给出它们在新架构中的统一落点。
+
+### 7.1 视觉能力（VisionPort）
+
+现状是**带外（out-of-band）**：HTTP 端点 `/mcp/vision/explain`（`core/api/vision_handler.py`）独立处理，设备直接 POST 图片+问题同步取结果；会话建立时通过 MCP `initialize.capabilities.vision` 把带 token 的 URL 下发设备。它**不走 WebSocket 对话流**。
+
+新设计：
+- `VisionPort`（driven port）= `describe(question, image) -> text`，现有 `VLLMProviderBase.response` 薄封装即得。
+- `VisionHttpAdapter`（**第二个 driving 适配器**，与 `TransportPort` 并列）：独立 HTTP 入口，调用 `VisionPort`，与主语音 pipeline 并行解耦。
+- 能力广播：`SessionStarted` 时由 device-MCP 握手 stage 发"vision 能力 + 鉴权 URL"出站事件。
+- 可选 in-band：再把 `VisionPort` 包成 `vision.describe` 工具挂到 `ToolPort`（见 7.5），让 LLM 主动看图。两种触发模式共用同一 driven port。
+
+### 7.2 上下文构建：PromptComposer 领域服务
+
+现状散落在 `prompt_manager.py`（模板 + 时间/天气/位置/农历静态富化）、`dialogue.py::get_llm_dialogue_with_memory`（四段拼装 + `is_temporary`）、`connection.py::_inject_tool_call_fewshot/_initialize_memory`。其中**静态前缀刻意前置以命中 prefix cache**，时间/记忆/说话人每轮重注入。
+
+新设计——纯领域编排，归入核心：
+- 领域聚合 `Dialogue`（在 `SessionContext` 内，保留 `is_temporary` 区分真实历史 vs few-shot）。
+- 领域服务 `PromptComposer`：分层拼装 **静态 cache 前缀 | few-shot | 动态块[时间/记忆/说话人] | 历史**（沉淀现 `get_llm_dialogue_with_memory` 为可测纯函数）。
+- 出站端口：`MemoryPort`(query/save)、`ContextProviderPort`(天气/位置/dynamic_context)、`ProfilePort`(设备私有配置 / 初始 summary memory)。
+- 生命周期映射：静态 prompt 在 `SessionStarted` 构建一次；时间/记忆/说话人在 `TurnStarted` 注入；记忆查询是 `LlmStage` 入口前一步（`MemoryPort.query(text)` → 注入动态块）。
+
+### 7.3 高级特性的通用解法（核心）
+
+**现状的根本问题**：元数据被**压平进文本字符串**（ASR 把 emotion/language/speaker 塞进 JSON 串 `enhanced_text`，到 `startToChat` 又拆出来只取 `content` 喂 LLM）——情绪/语速在进 LLM 前就丢了；LLM 情绪只能靠输出 emoji 反推；TTS 语速/音量是静态配置（`tts.py::convert_percentage_to_range`，`TTSMessageDTO` 无 prosody 字段）。三段断开。
+
+#### 7.3.1 强类型表示：核心规范层 + 扩展能力层
+
+- **核心规范层（封闭强类型）**：内置一小撮稳定模型 `Language / PerceivedEmotion / RenderEmotion / Prosody(emotion,style,rate,pitch,volume) / Speaker / Confidence`；核心 stage 直接编排。枚举用**开放枚举**（含 `OTHER` + 原始标签）防信息丢失。
+- **扩展能力层（开放强类型）**：实现者独有能力（如 `doubao.word_timestamps`）用**带类型的 Signal 令牌**表示，`key` 命名空间化 `vendor.feature` 可带版本。
+- **元数据容器**：不是 `dict[str, Any]`，而是**按 Signal 令牌索引的强类型异构容器** `MetadataBag.get(sig: Signal[T]) -> T | None`（type-indexed map）。它挂在事件上，也是 `TurnContext` 黑板。
+- **归一化 ACL**：实现者原始输出（`"<|SAD|>"` / valence-arousal / 概率分布）由其 adapter 映射进核心规范类型，核心永不见原始格式；反向 TTS adapter 把 `RenderEmotion` 映射回自家参数。
+
+> 注意：感知情绪 `asr.emotion : PerceivedEmotion` 与渲染情绪 `prosody.emotion : RenderEmotion` **是两个独立 Signal**，二者的翻译（共情逻辑）由 LLM 完成，不进类型系统。
+
+#### 7.3.2 两种绑定方向（区别于简单的"交集"）
+
+关键洞察：下游"消费"不是单一语义，存在两种绑定方向：
+
+- **前向 / 软拉取（opt-in pull）**：某 Signal 上游碰巧产出，下游**可选**取用。消费者常常**不是端口本身**——例如 `asr.emotion` 的消费者是 `PromptComposer` 的模板占位符 `{asr.emotion}`，`LlmPort` 对情绪无感知。有就填、无则空。
+- **反向 / 需求激活（demand-activated push）**：下游能力（TTS 情绪渲染）需要一个**本不存在**的 Signal，于是反向产生需求；编排器回溯找生产者——LLM 是 `prosody.*` 的**通用派生生产者**（`DirectiveProvider` = 提示词契约片段 + 输出解析器）。**只有当下游真的需要时，才把"输出 `<speak emotion style>`"的契约注入系统提示**，否则不激活、不浪费 token。
+
+#### 7.3.3 装配期协商 + 运行期轨迹（情绪四态示例）
+
+装配期（选定 adapter 后跑一次）：算 `produced = ⋃ provides()`、`wanted = consumes() ∪ wants()`；`produced ∩ wanted` 软拉取直接可用；`wanted − produced` 交给已知 `DirectiveProvider` 激活，并把 **TTS 支持的情绪集合回灌进 LLM 契约**（`可用情绪={gentle,excited,...}`，保证 LLM 只选 TTS 能渲染的）。输出"生效能力矩阵"供可观测。
+
+运行期一轮：
+```
+1. VoiceStopped → AsrStage：FunASR 写 TurnContext{asr.emotion=SAD, asr.speech_rate=-0.3}   【案例1 高级能力，门控产出】
+2. TurnStarted  → PromptComposer：模板 {asr.emotion} 填"难过"（无则留空，prompt 仍合法）       【案例2 消费方=模板，非LLM】
+3. LlmStage：LLM 流式出文本；DirectiveProvider 解析 <speak emotion=gentle style=安慰>
+            → 写 TurnContext.prosody；去标签文本进 TTS                                       【案例3 通用产出 + 案例4 反向要求】
+4. TtsStage：读 TurnContext.prosody → TtsPort.synthesize(text, prosody)；中性 TTS 直接忽略      【案例4 高级渲染】
+```
+
+**降级矩阵**（四态独立可组合）：
+
+| ASR 出情绪 | TTS 吃情绪 | 结果 |
+|---|---|---|
+| ✓ | ✓ | 用户情绪进 prompt 共情；LLM 被要求输出 prosody；TTS 渲染。全链路 |
+| ✗ | ✓ | prompt 无用户情绪，但 TTS 要 → LLM 仍输出 prosody（纯文本推断）。TTS 有情绪 |
+| ✓ | ✗ | LLM **不被要求**输出 prosody（prompt 精简）；asr.emotion 仍注入共情。两条线独立 |
+| ✗ | ✗ | 纯文本链路，零额外开销 |
+
+> 同一 ASR/LLM，仅换 TTS，系统提示里的"输出规范"段就自动增删——这就是"反向需求激活"与"软拉取"两种绑定共存的效果。`DirectiveProvider` 的输出契约对支持 JSON schema 的 LLM 可走 structured output 通道，与标签式在协商时择优（标签式通用但需剥流、structured 可靠但与逐 token 出声有张力）。
+
+### 7.4 声纹识别（VoiceprintPort）
+
+现状在 `ASRProviderBase.handle_voice_stop` 内 `asyncio.gather` 与 ASR 并行跑 `VoiceprintProvider.identify_speaker`，merge 进 `enhanced_text` 并注入 `<speakers_info>`。
+
+新设计：声纹是 7.3 "元数据 enrichment"的一个**具体实例**——`VoiceprintPort.identify(pcm, session) -> Speaker`，在 `AsrStage` 内与 ASR 并行（保留 gather）或拆为 `SpeakerIdStage` 订阅 `VoiceStopped`；输出写 `TurnContext.speaker`（强类型，不再拼字符串），由 `PromptComposer` 消费注入动态块。与情绪/语速共用同一套机制，不再是特例。
+
+### 7.5 工具（ToolPort：静态固定 + 会话级动态）
+
+现状 `UnifiedToolManager` 按 `ToolType`(SERVER_PLUGIN / SERVER_MCP / DEVICE_IOT / DEVICE_MCP / MCP_ENDPOINT) 注册并路由；内置固定 = `@register_function` + `auto_import_modules`；会话级动态 = 设备 `iot` descriptors / `mcp` tools/list 运行时注册；`ActionResponse.Action`(RESPONSE/REQLLM/RECORD/ERROR) 驱动 LLM 循环。
+
+新设计：
+- `ToolPort` = `list() -> [ToolDef]` + `execute(name, args) -> ActionResponse`。
+- **`CompositeToolPort`**（保留聚合+路由）聚合按**作用域**划分的 provider：
+  - `StaticToolProvider`（进程级）：装饰器注册表 → 内置固定工具。`handle_exit_intent` 映射为领域动作（置 `close_after_chat` → 触发 `TurnCompleted`/`SessionEnded`）。
+  - `SessionToolProvider`（会话级、动态）：订阅入站事件——`IotDescriptors` → 注册本会话 IoT 工具（如"调音量"）；`McpToolsListed` → 注册 device-MCP 工具。仅活在 `SessionContext` 生命周期内。
+- `LlmStage` 每轮从 `ToolPort.list()` 取当前可用工具（自然含动态新增的设备工具）；工具调用产 `LlmToolCallRequested` → `ToolPort.execute` → `ToolExecuted`（`enqueue_tool_report` 变订阅 hook）。`ActionResponse.Action` 作为**领域契约**入核心，决定循环是否递归/注入/结束。
+
+### 7.6 端口 / 事件 / 黑板 汇总（本节新增项）
+
+| 类别 | 新增项 |
+|---|---|
+| Driven Ports | `VisionPort` · `VoiceprintPort` · `ToolPort`(CompositeToolPort) · `MemoryPort` · `ContextProviderPort` · `ProfilePort` |
+| Driving Ports | `VisionHttpAdapter`（与 `TransportPort` 并列的第二入站适配器） |
+| 入站事件 | `IotDescriptors` · `IotStates` · `McpToolsListed` · `VisionRequested` |
+| 内部事件 | `SpeakerIdentified` · `LlmToolCallRequested` · `ToolExecuted` |
+| TurnContext 黑板字段（Signal） | `asr.emotion` · `asr.speech_rate` · `language` · `speaker` · `prosody` · `vendor.*`(扩展) |
+| 领域契约 | `ActionResponse.Action`(RESPONSE/REQLLM/RECORD/ERROR) · `Signal[T]` · `Capability/DirectiveProvider` |
+
+---
+
+## 八、技术框架与工程化选型（实现层）
+
+抽象设计与技术栈解耦，但落地需钉死一套现代 Python 技术栈：**uv · Python 3.12 · Pydantic v2 · FastAPI/uvicorn · litellm · Ruff**。核心原则——**六边形纯度**：领域核心只依赖 `Pydantic v2 + 标准库`，框架性依赖（FastAPI/uvicorn、litellm）一律封在适配器层。
+
+### 8.1 抽象 → 技术 映射
+
+| 抽象概念 | 技术落地 | 位置（六边形分层） |
+|---|---|---|
+| 包管理 / monorepo / 锁定 | **uv**（workspace 管理 `xiaozhi-core` 与 `xiaozhi-server`，`uv.lock` 锁定，`uv run` 跑脚本） | 工程根 |
+| 语言基线 | **Python 3.12**：PEP 695 泛型语法 `class Signal[T]` / `type` 别名、`asyncio.TaskGroup`（替代裸 gather 管理 stage 任务）、`@override` | 全局 |
+| 事件 / DTO / Signal / 配置 强类型 | **Pydantic v2**：`Event`/`*MessageDTO`/`Prosody`/`Speaker` 为 `BaseModel`；入站消息用 **discriminated union**（`type` 字段判别）一次性解析校验；`MetadataBag` 值用 `TypeAdapter` 按 Signal schema 运行时校验；配置用 `pydantic-settings`（沿用 `selected_module` 思路） | **领域核心**（仅此一项框架依赖） |
+| 入站适配器（设备接入 / 视觉 / OTA） | **FastAPI + uvicorn**：`WebSocketTransport` 用 FastAPI `WebSocket`；`VisionHttpAdapter`、OTA 用 FastAPI 路由；`uvicorn` ASGI 承载；`lifespan` 管理启动/关闭与 GC 管理器 | Driving Adapters |
+| LLM 驱动适配器 | **litellm**：`LlmPort` 单一适配器统一 OpenAI/Ollama/Gemini/Coze/Dify… 的流式、function calling、structured output（`response_format`）；记忆 embedding 也走 litellm。**替代现有 `core/providers/llm/*` 一堆按厂商手写的实现** | LLM Driven Adapter |
+| 代码质量 | **Ruff**：lint + format 合一（替代 black/flake8/isort）；`ruff check`/`ruff format` 进 CI 与 pre-commit | 工程根 |
+
+### 8.2 工程骨架（pyproject + uv workspace）
+
+```toml
+# 根 pyproject.toml —— uv workspace
+[tool.uv.workspace]
+members = ["main/xiaozhi-core", "main/xiaozhi-server"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+
+# main/xiaozhi-core/pyproject.toml —— 领域核心：保持框架无关
+[project]
+name = "xiaozhi-core"
+requires-python = ">=3.12"
+dependencies = ["pydantic>=2.7", "pydantic-settings>=2.3"]   # 仅此；不依赖 FastAPI/litellm
+
+[project.optional-dependencies]
+adapters = ["litellm>=1.40"]          # LLM 适配器按需装
+server   = ["fastapi>=0.111", "uvicorn[standard]>=0.30"]   # 入站适配器/运行时
+```
+
+要点：
+- **核心 `dependencies` 不含 FastAPI/litellm/uvicorn**，确保领域逻辑可在无网络、无 Web 框架下单测；适配器与运行时通过 optional-extras 引入，体现六边形依赖方向。
+- `uv run --package xiaozhi-server xiaozhi-server` 启动；`uv run pytest`、`uv run ruff check` 统一入口。
+
+### 8.3 关键技术落点示例
+
+```python
+# 领域核心：Python 3.12 PEP 695 泛型 + Pydantic v2（无框架依赖）
+class Signal[T](BaseModel):
+    model_config = ConfigDict(frozen=True)
+    key: str                      # "asr.emotion" / "prosody" / "vendor.feature"
+    doc: str = ""
+
+class AsrFinalized(BaseModel):    # 事件即强类型，metadata 走 Signal 索引容器
+    type: Literal["asr.finalized"] = "asr.finalized"
+    turn_id: str
+    text: str
+
+# LLM 适配器：litellm 统一多厂商 + 流式 + structured output（封在适配器层）
+class LiteLlmAdapter:             # implements LlmPort
+    async def stream(self, messages: list[dict], response_format=None):
+        async for chunk in await litellm.acompletion(
+            model=self.model, messages=messages, stream=True,
+            response_format=response_format,           # 7.3 DirectiveProvider 的 structured 通道
+        ):
+            yield chunk.choices[0].delta
+
+# 入站适配器：FastAPI WebSocket（封在 driving adapter 层）
+@app.websocket("/xiaozhi/v1/")
+async def ws(ws: WebSocket):
+    await WebSocketTransport(ws).run()   # 解析帧/JSON → 发布入站事件到 EventBus
+```
+
+### 8.4 与现状的取舍
+
+- **litellm 替代手写 LLM providers**：现有 9+ 个厂商实现收敛为一个适配器，新增模型零代码；`response_with_functions` 的 (text, tool_call) 流式语义由 litellm 统一提供。少数特殊厂商（Coze/Dify 这类非 OpenAI 协议的"工作流"型）仍可保留独立适配器实现 `LlmPort`，与 litellm 适配器并存。
+- **FastAPI 替代裸 `websockets` + `aiohttp`**：WS、视觉 HTTP、OTA 三个入口统一到一个 ASGI 应用与一套鉴权依赖（`Depends`），`lifespan` 收口启动顺序。
+- **asyncio 统一**：3.12 `TaskGroup` 管理 per-session 的 stage 任务，替代现状"裸线程 + `queue.Queue` + `run_coroutine_threadsafe`"混合模型（阻塞型本地推理用 `run_in_executor` 包裹）。
+- **Pydantic v2 进核心是有意为之**：它只是数据建模与校验，不绑定 IO/框架，不破坏六边形纯度，却为事件/Signal/配置带来统一的强类型与运行时校验。
