@@ -2,7 +2,7 @@
 
 import asyncio
 
-from xiaozhi_core import AdapterSet, PromptComposer, SpeakerInfo, XiaozhiServer
+from xiaozhi_core import AdapterSet, DialogueState, PromptComposer, SpeakerInfo, XiaozhiServer
 from xiaozhi_core.domain.events import AbortRequested, AudioFrameReceived
 from xiaozhi_core.testing import (
     SILENCE_FRAME,
@@ -150,6 +150,48 @@ def test_abort_stops_output():
         await runtime.emit(AudioFrameReceived(frame=SILENCE_FRAME))
         await runtime.emit(AudioFrameReceived(frame=SILENCE_FRAME))
         assert len(transport.sent_audio) >= before  # 不再产生新一轮音频前的残留
+
+    asyncio.run(run())
+
+
+def test_llm_failure_converges_turn_and_session_recovers():
+    """LLM 抛错不能让会话卡死：本轮收束（tts:stop + 回 IDLE），下一轮正常对话。"""
+
+    class FlakyLlm(ScriptedLlm):
+        def __init__(self):
+            super().__init__()
+            self.fail_next = True
+
+        async def stream(self, messages, tools=None):
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("LLM 网络故障")
+                yield  # pragma: no cover —— 保持 async generator 形态
+            async for delta in super().stream(messages, tools):
+                yield delta
+
+    async def run():
+        tts = EmotionalFakeTts()
+        transport = InMemoryTransport()
+        llm = FlakyLlm()
+        server = XiaozhiServer(
+            adapters=AdapterSet(
+                vad=FakeVad(), asr=FakeAsr(), llm=llm, tts=tts, transport=transport
+            ),
+            composer=PromptComposer("你是助手。"),
+        )
+        runtime = server.create_session()
+        await runtime.start()
+
+        await _speak_one_utterance(runtime)  # 第一轮：LLM 抛错
+        assert runtime.state_machine.state is DialogueState.IDLE  # 状态机已收束
+        assert runtime.session.current_turn is None
+        stops = [m for m in transport.sent_events if m.get("state") == "stop"]
+        assert stops  # 设备侧收到 tts:stop，播放收束
+
+        await _speak_one_utterance(runtime)  # 第二轮：正常对话
+        assert tts.synth_calls  # 第二轮产出了语音
+        assert runtime.state_machine.state is DialogueState.IDLE
 
     asyncio.run(run())
 

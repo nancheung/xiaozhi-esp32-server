@@ -14,8 +14,10 @@ AsrStage 再消费）。
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ..domain.capabilities import (
     DirectiveProvider,
@@ -142,21 +144,48 @@ class SessionRuntime:
             await self.adapters.transport.close()
 
     async def run(self) -> None:
-        """消费 Transport 入站事件直到连接结束。"""
+        """消费 Transport 入站事件直到连接结束。
+
+        打断旁路：读流任务持续消费入站，``AbortRequested`` 不排队、立即处理
+        （置 aborted 标志 + 下发 tts:stop），进行中的轮次在最近的检查点
+        （LLM delta / TTS chunk / 出帧间隙）自行退出；其余事件经队列按序
+        处理，保持 VAD 帧时序等顺序语义。
+        """
         transport = self.adapters.transport
         if transport is None:
             raise RuntimeError("AdapterSet.transport 未配置，无法 run()；可改用 emit() 注入事件")
         await self.start()
+        queue: asyncio.Queue[Event | None] = asyncio.Queue()
+
+        async def read_inbound() -> None:
+            try:
+                async for event in transport.events():
+                    if isinstance(event, AbortRequested):
+                        await self.emit(event)  # 旁路：立即打断，不排在轮次后面
+                    else:
+                        queue.put_nowait(event)
+            finally:
+                queue.put_nowait(None)  # 连接结束哨兵
+
+        reader = asyncio.create_task(read_inbound())
         try:
-            async for event in transport.events():
+            while (event := await queue.get()) is not None:
                 await self.emit(event)
+            await reader  # 正常结束：让读流任务的异常（如传输层错误）显式上抛
         finally:
+            reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reader
             await self.stop()
 
 
 @dataclass(slots=True)
 class XiaozhiServer:
-    """会话工厂：持有装配模板，按连接创建 SessionRuntime。"""
+    """会话工厂：持有装配模板，按连接创建 SessionRuntime。
+
+    有状态 adapter（VAD 窗口、Transport 连接）是会话级实例：静态 ``adapters``
+    只能开一个会话；多连接场景必须用 ``adapters_factory`` 按会话新建。
+    """
 
     adapters_factory: Callable[[], AdapterSet] | None = None
     adapters: AdapterSet | None = None
@@ -164,16 +193,23 @@ class XiaozhiServer:
     pipeline_factory: Callable[[], Pipeline] = Pipeline.default
     hooks: Sequence[Hook] = ()
     rate_controller_factory: Callable[[], AudioRateController] | None = None
+    _static_adapters_used: bool = field(default=False, init=False)
 
     def create_session(self, transport: TransportPort | None = None) -> SessionRuntime:
         if self.adapters_factory is not None:
             adapters = self.adapters_factory()
         elif self.adapters is not None:
+            if self._static_adapters_used:
+                raise RuntimeError(
+                    "静态 adapters 已被会话占用：有状态 adapter（VAD/Transport）不可跨会话"
+                    "共享，多会话场景请改用 adapters_factory 按会话新建"
+                )
+            self._static_adapters_used = True
             adapters = self.adapters
         else:
             raise ValueError("需提供 adapters 或 adapters_factory")
         if transport is not None:
-            adapters.transport = transport
+            adapters = replace(adapters, transport=transport)  # 不改写装配模板本体
         rate_controller = (
             self.rate_controller_factory() if self.rate_controller_factory is not None else None
         )

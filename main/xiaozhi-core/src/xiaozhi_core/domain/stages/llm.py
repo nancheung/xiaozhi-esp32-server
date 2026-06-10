@@ -46,7 +46,17 @@ class LlmStage(Stage):
         turn = self.rt.session.current_turn
         if turn is None or turn.aborted:
             return
+        # 故障收束：LLM / 记忆等任何环节抛错时补发 LAST 段，让 TtsStopped ->
+        # on_finished 链路把状态机带回 IDLE——否则异常被事件总线吞掉后，
+        # 会话将永久卡在 THINKING（后续语音事件全被状态机忽略）。
+        try:
+            await self._respond(turn)
+        except Exception:
+            logger.exception("LLM 轮次处理失败，收束本轮: turn_id=%s", turn.turn_id)
+            if not turn.aborted:
+                await self.rt.emit(TtsSentenceSegmented(position=SentencePosition.LAST))
 
+    async def _respond(self, turn: TurnContext) -> None:
         session = self.rt.session
         session.dialogue.put(Message(role="user", content=turn.user_text))
 

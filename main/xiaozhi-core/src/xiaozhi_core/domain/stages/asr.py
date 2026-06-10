@@ -54,6 +54,8 @@ class AsrStage(Stage):
             else:
                 text = await self.rt.adapters.asr.transcribe(frames, turn.meta)
 
+        if turn.aborted:  # 识别期间被并发打断（run() 的 abort 旁路）
+            return
         if not text.strip():
             self.rt.state_machine.cancel_turn()
             return

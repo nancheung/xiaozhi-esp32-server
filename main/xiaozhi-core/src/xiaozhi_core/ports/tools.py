@@ -13,11 +13,14 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
 
 from ..domain.actions import Action, ActionResponse, ToolDefinition
+
+logger = logging.getLogger(__name__)
 
 ToolFunc = Callable[..., Any]
 
@@ -57,9 +60,15 @@ class _RegistryToolProvider(ToolPort):
         if entry is None:
             return ActionResponse(action=Action.ERROR, result=f"未知工具: {name}")
         _, func = entry
-        result = func(**arguments)
-        if inspect.isawaitable(result):
-            result = await result
+        # LLM 生成的参数不可信（幻觉参数 / 类型错误），工具自身也可能抛错——
+        # 失败转 ERROR 回灌而非上抛：上抛会被事件总线吞掉，本轮无法收束。
+        try:
+            result = func(**arguments)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            logger.exception("工具执行失败: name=%s arguments=%s", name, arguments)
+            return ActionResponse(action=Action.ERROR, result=f"工具 {name} 执行失败: {exc}")
         if isinstance(result, ActionResponse):
             return result
         return ActionResponse(action=Action.REQLLM, result=str(result))

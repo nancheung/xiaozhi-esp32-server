@@ -37,6 +37,9 @@ uv run python examples/minimal_server.py   # 跑能力协商对比演示（无�
 - **`testing/`** —— `xiaozhi_core.testing`：零依赖 Fake 工具箱，覆盖每个 Port，是受支持的公共测试
   入口（tests 与 `examples/` 共用，下游也可复用）。默认值中性，剧情数据由构造参数注入。
 - **`runtime/`** —— 装配层：`XiaozhiServer`（会话工厂，持装配模板）+ `SessionRuntime`（单会话装配结果）。
+  静态 `adapters=` 只能开一个会话（有状态 adapter 不可跨会话共享，二次 `create_session` 会 fail-fast）；
+  多连接场景必须用 `adapters_factory`。`run()` 内 `AbortRequested` 走旁路立即处理（不排在轮次后面），
+  其余入站事件经队列按序处理——进行中的轮次靠各检查点的 `turn.aborted` 自行退出。
 
 接入方三步启动：选/写 adapter → 配 `PromptComposer` 人设 → `create_session().run()`。
 
