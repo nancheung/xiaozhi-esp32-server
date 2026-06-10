@@ -11,7 +11,8 @@
 import asyncio
 
 from xiaozhi_core import AdapterSet, PromptComposer, XiaozhiServer
-from xiaozhi_core.adapters.testing import (
+from xiaozhi_core.domain.events import AudioFrameReceived
+from xiaozhi_core.testing import (
     SILENCE_FRAME,
     VOICE_FRAME,
     EmotionalFakeTts,
@@ -22,17 +23,21 @@ from xiaozhi_core.adapters.testing import (
     NeutralFakeTts,
     ScriptedLlm,
 )
-from xiaozhi_core.domain.events import AudioFrameReceived
 
 
 async def run_scenario(title: str, tts) -> None:
     print(f"\n{'=' * 24} {title} {'=' * 24}")
     transport = InMemoryTransport()
-    llm = ScriptedLlm()
+    # 工具箱默认值是中性的——本演示在此显式注入"疲惫用户 -> 温柔安慰"的剧情。
+    llm = ScriptedLlm(reply="听起来真的辛苦了。先休息一下，待会儿陪我聊聊好不好？")
     server = XiaozhiServer(
         adapters=AdapterSet(
             vad=FakeVad(),
-            asr=FakeAsr(),
+            asr=FakeAsr(
+                text="我今天好累，什么都不想做",
+                raw_emotion="<|SAD|>",
+                speech_rate=-0.3,
+            ),
             llm=llm,
             tts=tts,
             transport=transport,

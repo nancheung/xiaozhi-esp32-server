@@ -1,6 +1,8 @@
-"""测试/示例用 Fake 适配器：无外部依赖即可跑通完整链路。
+"""零依赖 Fake 适配器实现。
 
-同时是「实现者如何声明 / 生产 / 消费」的参考样例：
+每个 Port 都有一个无外部依赖即可运行的 Fake，覆盖 vad/asr/llm/tts/transport/
+memory/voiceprint。它们同时是「实现者如何声明 / 生产 / 消费 Signal」的参考样例：
+
 - ``FakeAsr``：``provides()`` 受 ``supports_emotion`` 门控——高级能力非核心能力；
   防腐层把厂商原始标签归一化为核心规范类型后写入轮次黑板。
 - ``EmotionalFakeTts``：``wants() -> {S.prosody}`` 软需求，反向激活 LLM 输出契约；
@@ -8,6 +10,9 @@
 - ``NeutralFakeTts``：零声明 -> 链路自动降级为纯文本。
 - ``ScriptedLlm``：自身对元数据零感知；是否输出 ``<speak>`` 标签完全由系统提示里
   有没有被激活的 [输出规范] 契约决定。
+
+构造默认值刻意保持中性、通用；具体场景（情绪、台词、说话人）由调用方按需用
+构造参数注入——使用方与示例各自掌控自己的剧情。
 """
 
 from __future__ import annotations
@@ -74,9 +79,9 @@ class FakeVad(VadPort):
 class FakeAsr(AsrPort):
     def __init__(
         self,
-        text: str = "我今天好累，什么都不想做",
-        raw_emotion: str | None = "<|SAD|>",
-        speech_rate: float = -0.3,
+        text: str = "你好",
+        raw_emotion: str | None = None,
+        speech_rate: float = 0.0,
         supports_emotion: bool = True,
     ) -> None:
         self._text = text
@@ -101,7 +106,7 @@ class FakeAsr(AsrPort):
 
 class FakeVoiceprint(VoiceprintPort):
     def __init__(self, speaker: SpeakerInfo | None = None) -> None:
-        self._speaker = speaker or SpeakerInfo(name="阿珍", description="家人，喜欢开玩笑")
+        self._speaker = speaker or SpeakerInfo(name="测试用户")
 
     async def identify(self, frames: list[bytes]) -> SpeakerInfo | None:
         return self._speaker
@@ -110,7 +115,7 @@ class FakeVoiceprint(VoiceprintPort):
 class ScriptedLlm(LlmPort):
     """按系统提示内容决定输出形态；记录最近一次 messages 供测试断言。"""
 
-    def __init__(self, reply: str = "听起来真的辛苦了。先休息一下，待会儿陪我聊聊好不好？") -> None:
+    def __init__(self, reply: str = "好的，我明白了。") -> None:
         self._reply = reply
         self.last_messages: list[dict[str, Any]] = []
 

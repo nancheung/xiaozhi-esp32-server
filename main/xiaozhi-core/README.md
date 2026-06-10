@@ -34,9 +34,28 @@ src/xiaozhi_core/
     services/        #   切句 / 替换词滑窗 / 音频限流 / 提示词分层拼装
   ports/             # 端口契约（vad/asr/llm/tts/tools/memory/intent/vision/voiceprint/...）
   runtime/           # SessionRuntime / XiaozhiServer 装配
-  adapters/          # litellm（extra: llm）/ FastAPI WebSocket（extra: server）/ 测试桩
+  adapters/          # litellm（extra: llm）/ FastAPI WebSocket（extra: server）
+  testing/           # 零依赖 Fake 工具箱（覆盖每个 Port，供下游测试复用）
   hooks/             # logging_hook 等事件订阅旁路
 ```
+
+## 测试工具箱（`xiaozhi_core.testing`）
+
+随发行包一起发布的零依赖 Fake，覆盖每个 Port。下游为某个 Port 写真实 adapter 时，
+可直接用它装配一条完整会话、对编排行为做断言，无需任何外部服务：
+
+```python
+from xiaozhi_core import AdapterSet, PromptComposer, XiaozhiServer
+from xiaozhi_core.testing import FakeVad, FakeAsr, ScriptedLlm, EmotionalFakeTts
+
+server = XiaozhiServer(
+    adapters=AdapterSet(vad=FakeVad(), asr=FakeAsr(), llm=ScriptedLlm(), tts=MyRealTts()),
+    composer=PromptComposer("你是助手。"),
+)
+```
+
+Fake 默认值保持中性，具体场景（情绪、台词、说话人）由构造参数注入——参见
+[`examples/minimal_server.py`](examples/minimal_server.py) 如何用它演示情绪全链路。
 
 ## 高级特性的通用机制（情绪示例）
 

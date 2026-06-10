@@ -2,8 +2,9 @@
 
 import asyncio
 
-from xiaozhi_core import AdapterSet, PromptComposer, XiaozhiServer
-from xiaozhi_core.adapters.testing import (
+from xiaozhi_core import AdapterSet, PromptComposer, SpeakerInfo, XiaozhiServer
+from xiaozhi_core.domain.events import AbortRequested, AudioFrameReceived
+from xiaozhi_core.testing import (
     SILENCE_FRAME,
     VOICE_FRAME,
     EmotionalFakeTts,
@@ -15,7 +16,6 @@ from xiaozhi_core.adapters.testing import (
     NeutralFakeTts,
     ScriptedLlm,
 )
-from xiaozhi_core.domain.events import AbortRequested, AudioFrameReceived
 
 
 def _make_runtime(tts, asr=None, memory=None, voiceprint=None):
@@ -24,7 +24,8 @@ def _make_runtime(tts, asr=None, memory=None, voiceprint=None):
     server = XiaozhiServer(
         adapters=AdapterSet(
             vad=FakeVad(),
-            asr=asr or FakeAsr(),
+            # 工具箱默认中性，本套用例的剧情是"疲惫(sad)用户"——显式注入
+            asr=asr or FakeAsr(raw_emotion="<|SAD|>", speech_rate=-0.3),
             llm=llm,
             tts=tts,
             transport=transport,
@@ -105,7 +106,10 @@ def test_plain_asr_no_emotion_line():
 
 def test_voiceprint_enrichment():
     async def run():
-        runtime, _, llm = _make_runtime(EmotionalFakeTts(), voiceprint=FakeVoiceprint())
+        speaker = SpeakerInfo(name="阿珍", description="家人，喜欢开玩笑")
+        runtime, _, llm = _make_runtime(
+            EmotionalFakeTts(), voiceprint=FakeVoiceprint(speaker)
+        )
         await runtime.start()
         await _speak_one_utterance(runtime)
         system_text = "\n".join(m["content"] for m in llm.last_messages if m["role"] == "system")

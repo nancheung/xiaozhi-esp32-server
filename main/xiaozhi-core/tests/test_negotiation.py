@@ -1,8 +1,8 @@
 """装配期能力协商：情绪四态降级矩阵（架构文档 7.3.3）。"""
 
 from xiaozhi_core import MetadataBag, PromptComposer, Prosody, RenderEmotion, S, negotiate
-from xiaozhi_core.adapters.testing import EmotionalFakeTts, FakeAsr, NeutralFakeTts
 from xiaozhi_core.domain.capabilities import SpeakTagDirective
+from xiaozhi_core.testing import EmotionalFakeTts, FakeAsr, NeutralFakeTts
 
 
 def _negotiate(asr, tts):

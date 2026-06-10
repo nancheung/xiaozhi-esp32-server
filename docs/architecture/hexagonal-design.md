@@ -213,6 +213,7 @@ main/xiaozhi-core/                 # 新包；不动现有 xiaozhi-server
       config.py                    # 配置 → 装配映射（沿用 selected_module 思路）
     hooks/                         # ReportHook/LoggingHook/EmotionHook/MetricsHook
   adapters/                        # 把现有 providers 包装为端口实现（薄封装）
+  testing/                         # 受支持的公共测试工具箱：零依赖 Fake，覆盖每个 Port，下游可复用
   examples/minimal_server.py       # 最小可运行 demo（VAD+ASR+LLM+TTS）
   pyproject.toml                   # 为未来独立发布预留
 ```
