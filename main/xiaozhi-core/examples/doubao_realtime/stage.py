@@ -53,6 +53,7 @@ from xiaozhi_core.domain.events import (
     VoiceStopped,
 )
 from xiaozhi_core.domain.pipeline import Stage
+from xiaozhi_core.domain.services.sentence_segmenter import SentenceSegmenter
 from xiaozhi_core.domain.state_machine import DialogueState
 
 from . import protocol
@@ -99,6 +100,9 @@ class DoubaoRealtimeStage(Stage):
         self._reply_turn_id: str | None = None
         # 注入（500/502）期间丢弃云端自答音频，直到 350(tts_type=chat_tts_text/external_rag)
         self._dropping_cloud_audio = False
+        # 回复文本切句下发（AudioOutputStage 据此发 tts/sentence_start，与 LlmStage 同构）
+        self._segmenter = SentenceSegmenter()
+        self._sentence_emitted = False
 
     async def handle(self, event: Event) -> None:
         if isinstance(event, SessionStarted):
@@ -154,12 +158,18 @@ class DoubaoRealtimeStage(Stage):
         elif event == protocol.EVENT_CHAT_RESPONSE:  # 550 云端 LLM 文本增量
             turn = self.rt.session.current_turn
             if turn is not None and not self._use_local_llm:
-                turn.assistant_text += str(payload.get("content", ""))
+                content = str(payload.get("content", ""))
+                turn.assistant_text += content
+                for segment in self._segmenter.feed(content):
+                    await self._emit_sentence(segment)
         elif event == protocol.EVENT_TTS_SENTENCE_START:  # 350
             if self._dropping_cloud_audio and payload.get("tts_type") in _RESUME_TTS_TYPES:
                 self._dropping_cloud_audio = False  # 注入内容的音频开始，恢复下发
         elif event == protocol.EVENT_TTS_ENDED:  # 359 本轮音频播完
             self._reply_turn_id = None
+            remainder = self._segmenter.flush()
+            if remainder:
+                await self._emit_sentence(remainder)
             turn = self.rt.session.current_turn
             if turn is not None and not self._use_local_llm and turn.assistant_text:
                 # 云端回复落账历史（本地接管路径在 takeover 内落账）
@@ -171,6 +181,8 @@ class DoubaoRealtimeStage(Stage):
 
     async def _on_user_finished(self) -> None:
         await self.rt.emit(VoiceStopped())  # 状态机在此 begin_turn
+        self._segmenter.reset()
+        self._sentence_emitted = False
         text = self._asr_text.strip()
         if not text:
             self.rt.state_machine.cancel_turn()
@@ -185,6 +197,12 @@ class DoubaoRealtimeStage(Stage):
             await self._local_llm_takeover(text)
         elif self.rt.adapters.memory is not None:
             await self._memory_rag_inject(text)
+
+    async def _emit_sentence(self, text: str) -> None:
+        """下发一段回复文本（AudioOutputStage 转为 tts/sentence_start 协议消息）。"""
+        position = SentencePosition.MIDDLE if self._sentence_emitted else SentencePosition.FIRST
+        self._sentence_emitted = True
+        await self.rt.emit(TtsSentenceSegmented(position=position, text=text))
 
     async def _query_memory(self, user_text: str) -> str | None:
         memory = self.rt.adapters.memory
@@ -210,6 +228,7 @@ class DoubaoRealtimeStage(Stage):
         reply = "".join(parts)
         turn.assistant_text = reply
         session.dialogue.put(Message(role="assistant", content=reply))
+        await self._emit_sentence(reply)  # 照念文本即完整回复，整段下发
         await self._client.send_chat_tts_text(start=True, end=False, content=reply)
         await self._client.send_chat_tts_text(start=False, end=True, content="")
 
@@ -220,6 +239,7 @@ class DoubaoRealtimeStage(Stage):
             return  # 无相关记忆：保持纯端到端，不丢音频
         self._dropping_cloud_audio = True
         if self._comfort_text:  # 安抚话术掩盖检索/重生成耗时（demo 同款两连发）
+            await self._emit_sentence(self._comfort_text)
             await self._client.send_chat_tts_text(start=True, end=False, content=self._comfort_text)
             await self._client.send_chat_tts_text(start=False, end=True, content="")
         await self._client.send_chat_rag_text(

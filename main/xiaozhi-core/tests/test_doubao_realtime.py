@@ -214,8 +214,14 @@ def test_full_turn_cloud_mode():
 
         assert client.sent_audio == [b"\x00" * 64]  # 入站音频直通豆包
         kinds = [(m.get("type"), m.get("state")) for m in transport.sent_events]
-        assert kinds == [("stt", None), ("tts", "start"), ("tts", "stop")]
+        assert kinds == [
+            ("stt", None),
+            ("tts", "start"),
+            ("tts", "sentence_start"),  # 550 增量切句下发回复文本
+            ("tts", "stop"),
+        ]
         assert transport.sent_events[0]["text"] == "今天天气怎么样"
+        assert transport.sent_events[2]["text"] == "今天晴。"
         assert transport.sent_audio == [b"A1", b"A2"]
         assert runtime.state_machine.state is DialogueState.IDLE
         assert len(completed) == 1
@@ -348,6 +354,8 @@ def test_memory_rag_injection():
         await run_script(client, runtime)
 
         assert client.chat_tts_texts == [(True, False, "稍等。"), (False, True, "")]
+        sentences = [m["text"] for m in transport.sent_events if m.get("state") == "sentence_start"]
+        assert sentences == ["稍等。"]  # 安抚话术也以 sentence_start 下发
         assert client.rag_texts == [
             json.dumps([{"title": "用户记忆", "content": "记忆内容"}], ensure_ascii=False)
         ]
@@ -396,7 +404,7 @@ def test_local_llm_uses_composer_and_memory():
                 full(359),
             ]
         )
-        runtime, _transport, llm = make_runtime(
+        runtime, transport, llm = make_runtime(
             client, use_local_llm=True, memory=InMemoryMemory("猫叫年糕")
         )
         await run_script(client, runtime)
@@ -411,6 +419,8 @@ def test_local_llm_uses_composer_and_memory():
             (True, False, "用户刚说了：我的猫叫什么"),
             (False, True, ""),
         ]
+        sentences = [m["text"] for m in transport.sent_events if m.get("state") == "sentence_start"]
+        assert sentences == ["用户刚说了：我的猫叫什么"]  # 照念文本整段下发
         # 历史落账：user + assistant 都进对话历史（memory.save 不再存空）
         history = [(m.role, m.content) for m in runtime.session.dialogue.history_messages()]
         assert history == [
