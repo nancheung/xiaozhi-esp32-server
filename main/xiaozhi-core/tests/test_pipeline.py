@@ -107,9 +107,7 @@ def test_plain_asr_no_emotion_line():
 def test_voiceprint_enrichment():
     async def run():
         speaker = SpeakerInfo(name="阿珍", description="家人，喜欢开玩笑")
-        runtime, _, llm = _make_runtime(
-            EmotionalFakeTts(), voiceprint=FakeVoiceprint(speaker)
-        )
+        runtime, _, llm = _make_runtime(EmotionalFakeTts(), voiceprint=FakeVoiceprint(speaker))
         await runtime.start()
         await _speak_one_utterance(runtime)
         system_text = "\n".join(m["content"] for m in llm.last_messages if m["role"] == "system")
