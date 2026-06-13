@@ -21,12 +21,13 @@ if __package__ in (None, ""):  # 支持直接 python demo_mic.py 运行
 from doubao_realtime import config
 from doubao_realtime.client import DoubaoRealtimeClient
 from doubao_realtime.echo_llm import EchoLlm
+from doubao_realtime.jsonl_memory import JsonlMemory
 from doubao_realtime.local_audio import MicTransport
 from doubao_realtime.stage import DoubaoRealtimeStage
 from xiaozhi_core import AdapterSet, PromptComposer, XiaozhiServer
 from xiaozhi_core.domain.pipeline import Pipeline
 from xiaozhi_core.domain.stages import AudioOutputStage
-from xiaozhi_core.testing import FakeAsr, FakeVad, InMemoryMemory, NeutralFakeTts, ScriptedLlm
+from xiaozhi_core.testing import FakeAsr, FakeVad, NeutralFakeTts, ScriptedLlm
 
 
 async def main() -> None:
@@ -42,7 +43,7 @@ async def main() -> None:
             tts=NeutralFakeTts(),
             transport=MicTransport(),
             # 装配 memory 即激活记忆链路：照念模式进本地 prompt，云端模式走 502 注入
-            memory=InMemoryMemory(config.memory_text) if config.memory_text else None,
+            memory=JsonlMemory(config.jsonl_path),
         ),
         # 本地照念模式下 PromptComposer 真实参与拼 prompt（{memory} 占位符消费记忆）；
         # 云端模式人设在豆包 StartSession 的 dialog 配置里，composer 不参与。

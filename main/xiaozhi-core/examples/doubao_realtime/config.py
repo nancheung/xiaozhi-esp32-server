@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
 # 回复路径有两条独立分支（装配期自动协商，对齐 core 设计理念）：
 #
@@ -83,3 +84,6 @@ output_audio_config = {
     "sample_rate": 24000,
     "sample_width": 4,  # paFloat32
 }
+
+# JSONL 对话记忆文件路径（相对运行目录；改绝对路径可跨目录共享历史）
+jsonl_path: Path = Path("examples/doubao_realtime/conversations.jsonl")
