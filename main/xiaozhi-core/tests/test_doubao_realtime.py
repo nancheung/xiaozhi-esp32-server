@@ -390,6 +390,84 @@ def test_memory_rag_skipped_without_memory():
     asyncio.run(run())
 
 
+def test_dropping_flag_resets_across_turns_after_abort():
+    """首轮 RAG 注入被打断（未收到 350 恢复信号），第二轮纯端到端音频不应被丢弃。"""
+
+    class OnceMemory:
+        """第一次 query 返回内容，之后返回空（模拟首轮有记忆、次轮无记忆）。"""
+
+        def __init__(self, content: str) -> None:
+            self._content = content
+            self._used = False
+
+        async def query(self, text: str) -> str:
+            if not self._used:
+                self._used = True
+                return self._content
+            return ""
+
+        async def save(self, role: str, content: str) -> None:
+            pass
+
+    async def run() -> None:
+        client = FakeDoubaoClient(
+            [
+                # 轮次 1：RAG 注入开始，被打断，350 未到
+                full(450),
+                full(451, {"results": [{"text": "我的猫叫什么"}]}),
+                full(459),
+                ack(b"CLOUD-T1"),  # 注入期间音频，应被丢弃
+                full(450),  # 用户再次说话，打断（THINKING 状态）
+                # 轮次 2：memory 返回空，纯端到端
+                full(451, {"results": [{"text": "你好"}]}),
+                full(459),
+                ack(b"CLOUD-T2"),  # 第二轮音频，不应被丢弃
+                full(359),
+            ]
+        )
+        runtime, transport, _ = make_runtime(client, memory=OnceMemory("猫叫年糕"))
+        await run_script(client, runtime)
+
+        assert b"CLOUD-T1" not in transport.sent_audio, "轮1云端音频应被丢弃"
+        assert b"CLOUD-T2" in transport.sent_audio, "轮2端到端音频不应被丢弃（脏标志已重置）"
+        await runtime.stop()
+
+    asyncio.run(run())
+
+
+def test_rag_injection_filters_cloud_550_text():
+    """知识注入期间，云端 550 文本应被丢弃；350(external_rag) 后的 550 文本应放行。"""
+
+    async def run() -> None:
+        client = FakeDoubaoClient(
+            [
+                full(450),
+                full(451, {"results": [{"text": "讲一个故事"}]}),
+                full(459),
+                full(550, {"content": "那你得先告诉我"}),  # 注入前云端文本，应丢弃
+                full(550, {"content": "一些信息。"}),  # 同上
+                ack(b"CLOUD"),  # 云端原始音频，应丢弃
+                full(350, {"tts_type": "chat_tts_text"}),  # 安抚话术 TTS 开始
+                ack(b"COMFORT"),
+                full(350, {"tts_type": "external_rag"}),  # RAG 音频开始，恢复放行
+                full(550, {"content": "故事开始了。"}),  # RAG 生成文本，应放行
+                ack(b"RAG"),
+                full(359),
+            ]
+        )
+        runtime, transport, _ = make_runtime(
+            client, memory=InMemoryMemory("记忆内容"), comfort_text="稍等。"
+        )
+        await run_script(client, runtime)
+
+        sentences = [m["text"] for m in transport.sent_events if m.get("state") == "sentence_start"]
+        assert sentences == ["稍等。", "故事开始了。"]
+        assert transport.sent_audio == [b"COMFORT", b"RAG"]
+        await runtime.stop()
+
+    asyncio.run(run())
+
+
 def test_local_llm_uses_composer_and_memory():
     """照念分支：prompt 经 PromptComposer 拼装，记忆走 {memory} 占位符进本地 prompt。"""
 

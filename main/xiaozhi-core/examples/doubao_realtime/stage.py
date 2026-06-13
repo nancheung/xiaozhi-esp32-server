@@ -157,7 +157,7 @@ class DoubaoRealtimeStage(Stage):
             await self._on_user_finished()
         elif event == protocol.EVENT_CHAT_RESPONSE:  # 550 云端 LLM 文本增量
             turn = self.rt.session.current_turn
-            if turn is not None and not self._use_local_llm:
+            if turn is not None and not self._use_local_llm and not self._dropping_cloud_audio:
                 content = str(payload.get("content", ""))
                 turn.assistant_text += content
                 for segment in self._segmenter.feed(content):
@@ -183,6 +183,7 @@ class DoubaoRealtimeStage(Stage):
         await self.rt.emit(VoiceStopped())  # 状态机在此 begin_turn
         self._segmenter.reset()
         self._sentence_emitted = False
+        self._dropping_cloud_audio = False  # 每轮开始时重置：旧轮注入状态不污染新轮
         text = self._asr_text.strip()
         if not text:
             self.rt.state_machine.cancel_turn()
