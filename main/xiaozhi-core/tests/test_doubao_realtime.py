@@ -561,6 +561,118 @@ def test_rag_reply_550_before_350_external_rag_is_buffered_and_released():
     asyncio.run(run())
 
 
+# ---------------------------------------------------------------------------
+# JSONL 文件记忆
+# ---------------------------------------------------------------------------
+
+from doubao_realtime.jsonl_memory import ConversationRecord, JsonlMemory
+
+
+# -- ConversationRecord --
+
+
+def test_conversation_record_roundtrip():
+    """to_jsonl_line / from_json_line 往返无损。"""
+    rec = ConversationRecord(role="user", content="你好", time="2024-01-01T12:00:00+00:00", session_id="s1")
+    assert ConversationRecord.from_json_line(rec.to_jsonl_line()) == rec
+
+
+def test_conversation_record_prompt_line():
+    """prompt_line 只含 role / 截断后的 time / content，不含 session_id。"""
+    rec = ConversationRecord(role="assistant", content="晴天。", time="2024-01-15T08:30:00+00:00", session_id="s")
+    assert rec.prompt_line() == "[2024-01-15T08:30] assistant: 晴天。"
+    assert "session_id" not in rec.prompt_line()
+
+
+# -- JsonlMemory --
+
+
+def test_jsonl_memory_query_nonexistent_file(tmp_path):
+    """文件不存在时 query 返回 None。"""
+    assert asyncio.run(JsonlMemory(tmp_path / "mem.jsonl").query("x")) is None
+
+
+def test_jsonl_memory_query_reads_from_init_snapshot(tmp_path):
+    """query 返回初始化快照中的记录，格式化为 prompt_line。"""
+    path = tmp_path / "mem.jsonl"
+    r1 = ConversationRecord(role="user", content="你好", time="2024-01-01T12:00:00+00:00", session_id="s1")
+    r2 = ConversationRecord(role="assistant", content="你好，有什么能帮你？", time="2024-01-01T12:00:00+00:00", session_id="s1")
+    path.write_text(r1.to_jsonl_line() + "\n" + r2.to_jsonl_line() + "\n", encoding="utf-8")
+
+    result = asyncio.run(JsonlMemory(path).query("随便"))
+    assert "[2024-01-01T12:00] user: 你好" in result
+    assert "[2024-01-01T12:00] assistant: 你好，有什么能帮你？" in result
+    assert "session_id" not in result
+
+
+def test_jsonl_memory_query_excludes_current_session(tmp_path):
+    """save() 写入后同一实例 query() 看不到刚写入的数据。"""
+    from xiaozhi_core.domain.dialogue import Message
+
+    path = tmp_path / "mem.jsonl"
+    mem = JsonlMemory(path)  # 初始化时文件为空 → _records 为空
+    asyncio.run(mem.save([Message(role="user", content="本次问题"), Message(role="assistant", content="本次回复")], "cur"))
+    assert asyncio.run(mem.query("x")) is None
+
+
+def test_jsonl_memory_query_respects_max_records(tmp_path):
+    """max_records 限制只返回最后 N 条。"""
+    path = tmp_path / "mem.jsonl"
+    recs = [
+        ConversationRecord(role="user", content=f"消息{i}", time=f"2024-01-{i+1:02d}T10:00:00+00:00", session_id="s")
+        for i in range(5)
+    ]
+    path.write_text("".join(r.to_jsonl_line() + "\n" for r in recs), encoding="utf-8")
+
+    result = asyncio.run(JsonlMemory(path, max_records=2).query("x"))
+    assert "消息3" in result and "消息4" in result and "消息0" not in result
+
+
+def test_jsonl_memory_save_writes_all_messages(tmp_path):
+    """save() 将所有有内容的消息顺序写入 JSONL。"""
+    from xiaozhi_core.domain.dialogue import Message
+
+    path = tmp_path / "mem.jsonl"
+    asyncio.run(JsonlMemory(path).save([
+        Message(role="user", content="你好"),
+        Message(role="assistant", content="你好！"),
+        Message(role="user", content="天气怎么样"),
+        Message(role="assistant", content="晴天。"),
+    ], "sess-001"))
+
+    recs = [ConversationRecord.from_json_line(l) for l in path.read_text(encoding="utf-8").strip().splitlines()]
+    assert len(recs) == 4
+    assert recs[0].role == "user" and recs[0].content == "你好" and recs[0].session_id == "sess-001"
+    assert recs[1].role == "assistant" and recs[1].content == "你好！"
+    assert recs[3].content == "晴天。"
+
+
+def test_jsonl_memory_next_session_sees_previous_data(tmp_path):
+    """新实例初始化时可读到上一会话写入的数据。"""
+    from xiaozhi_core.domain.dialogue import Message
+
+    path = tmp_path / "mem.jsonl"
+    asyncio.run(JsonlMemory(path).save(
+        [Message(role="user", content="上次的问题"), Message(role="assistant", content="上次的回复")],
+        "prev",
+    ))
+    result = asyncio.run(JsonlMemory(path).query("x"))
+    assert "上次的问题" in result
+
+
+def test_jsonl_memory_save_skips_none_content(tmp_path):
+    """content 为 None 的消息不写入。"""
+    from xiaozhi_core.domain.dialogue import Message
+
+    path = tmp_path / "mem.jsonl"
+    asyncio.run(JsonlMemory(path).save(
+        [Message(role="user", content="有内容"), Message(role="assistant", content=None)],
+        "s",
+    ))
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1 and ConversationRecord.from_json_line(lines[0]).role == "user"
+
+
 def test_local_llm_uses_composer_and_memory():
     """照念分支：prompt 经 PromptComposer 拼装，记忆走 {memory} 占位符进本地 prompt。"""
 
