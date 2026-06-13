@@ -13,7 +13,8 @@
     SERVER_ACK 音频   -> TtsAudioChunkReady（首帧前补 on_speaking 转移，替代 TtsStage 职责）
     350 TTS开始      -> 控制丢弃标志；flush 已缓冲的 RAG 文本（见下方"RAG 文本时序"说明）
     351 TTS分句结束   -> 记录精确句子文本和音频时长（供日志和扩展）
-    359 TTSEnded     -> 仅在有 turn 时：TtsSentenceSegmented(LAST) + TtsStopped（收束本轮）
+    359 TTSEnded     -> 仅在有 turn 时：TtsSentenceSegmented(LAST) + TtsStopped（收束本轮）；
+                       status_code="20000002" 时额外异步触发 stop()（用户退出意图，关闭会话）
     550 ChatResponse -> 累积 turn.assistant_text（云端 LLM 模式，丢弃期按 reply_id 暂存）
     154 UsageResponse -> 记录 token 用量（info 日志）
     150 SessionStarted -> 记录 dialog_id（供续接对话）
@@ -106,6 +107,7 @@ class DoubaoRealtimeStage(Stage):
         self._comfort_text = comfort_text
         self._say_hello = say_hello
         self._receive_task: asyncio.Task[None] | None = None
+        self._stop_task: asyncio.Task[None] | None = None
         self._connected = False
         self._dialog_id: str | None = None  # 服务端 150 返回，可用于续接对话
         self._asr_text = ""
@@ -254,6 +256,9 @@ class DoubaoRealtimeStage(Stage):
             if self._sentence_emitted:
                 await self.rt.emit(TtsSentenceSegmented(position=SentencePosition.LAST))
             await self.rt.emit(TtsStopped())
+            if payload.get("status_code") == "20000002":
+                logger.info("豆包识别到用户退出意图（status_code=20000002），关闭会话")
+                self._stop_task = asyncio.create_task(self.rt.stop())
         elif event == protocol.EVENT_SESSION_FINISHED:  # 152
             logger.info("豆包会话正常结束")
         elif event == protocol.EVENT_SESSION_FAILED:  # 153

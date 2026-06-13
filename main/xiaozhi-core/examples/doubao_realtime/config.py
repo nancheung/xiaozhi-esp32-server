@@ -62,6 +62,7 @@ start_session_req = {
             "audit_response": "支持客户自定义安全审核回复话术。",
             "recv_timeout": 10,
             "input_mod": "audio",
+            "enable_user_query_exit": True
         },
     },
 }
