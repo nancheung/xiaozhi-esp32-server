@@ -43,7 +43,7 @@ start_session_req = {
         },
     },
     "tts": {
-        "speaker": "zh_male_yunzhou_jupiter_bigtts",
+        "speaker": "zh_female_xiaohe_jupiter_bigtts",
         "audio_config": {
             "channel": 1,
             "format": "pcm",
@@ -62,7 +62,9 @@ start_session_req = {
             "audit_response": "支持客户自定义安全审核回复话术。",
             "recv_timeout": 10,
             "input_mod": "audio",
-            "enable_user_query_exit": True
+            # rag注入后，识别退出和唱歌 失效
+            "enable_user_query_exit": True,
+            "enable_music": True
         },
     },
 }
