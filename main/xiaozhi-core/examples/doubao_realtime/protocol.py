@@ -47,15 +47,19 @@ EVENT_CHAT_TEXT_QUERY = 501
 EVENT_CHAT_RAG_TEXT = 502
 
 # 服务端事件
+EVENT_SESSION_STARTED = 150   # 服务端确认 session 建立，payload 含 dialog_id
 EVENT_SESSION_FINISHED = 152
 EVENT_SESSION_FAILED = 153
+EVENT_USAGE_RESPONSE = 154    # token 用量统计（每轮交互后下发）
 EVENT_TTS_SENTENCE_START = 350
+EVENT_TTS_SENTENCE_END = 351  # 分句 TTS 结束，payload 含精确文本和音频时长
 EVENT_TTS_ENDED = 359
 EVENT_ASR_INFO = 450  # 用户开始说话（SPEAKING 中收到即打断信号）
 EVENT_ASR_RESPONSE = 451  # ASR 识别文本（增量覆盖）
 EVENT_ASR_ENDED = 459  # 用户说话结束
 EVENT_CHAT_RESPONSE = 550  # 云端 LLM 文本增量
 EVENT_CHAT_ENDED = 559     # 云端 LLM 文本生成结束
+EVENT_DIALOG_COMMON_ERROR = 599  # 实时通话期间错误描述
 
 
 def encode_frame(
