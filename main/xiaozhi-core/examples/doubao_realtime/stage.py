@@ -106,6 +106,8 @@ class DoubaoRealtimeStage(Stage):
         # 回复文本切句下发（AudioOutputStage 据此发 tts/sentence_start，与 LlmStage 同构）
         self._segmenter = SentenceSegmenter()
         self._sentence_emitted = False
+        # RAG 注入时，部分 550 文本先于 350(external_rag) 到达——用 reply_id 暂存
+        self._pending_rag_text: dict[str, str] = {}
 
     async def handle(self, event: Event) -> None:
         if isinstance(event, SessionStarted):
@@ -137,7 +139,7 @@ class DoubaoRealtimeStage(Stage):
             logger.exception("豆包接收循环异常退出，会话不再产出应答")
 
     async def _on_message(self, message: ServerMessage) -> None:
-        logger.debug("收到豆包消息：%s", message.to_dict())
+        logger.info("收到豆包消息：%s", message.to_dict())
         if message.kind == "error":
             raise RuntimeError(f"豆包服务端错误 code={message.code}: {message.payload}")
         if message.kind == "ack":
@@ -161,17 +163,36 @@ class DoubaoRealtimeStage(Stage):
             await self._on_user_finished()
         elif event == protocol.EVENT_CHAT_RESPONSE:  # 550 云端 LLM 文本增量
             turn = self.rt.session.current_turn
-            if turn is not None and not self._use_local_llm and not self._dropping_cloud_text:
+            if turn is None or self._use_local_llm:
+                pass  # 无轮次或本地 LLM 接管，550 不参与
+            elif not self._dropping_cloud_text:
                 content = str(payload.get("content", ""))
                 turn.assistant_text += content
                 for segment in self._segmenter.feed(content):
                     await self._emit_sentence(segment)
+            else:
+                # 丢弃期：新 reply_id 的 550 先于 350(external_rag) 到达，暂存以备 flush
+                reply_id = str(payload.get("reply_id", ""))
+                content = str(payload.get("content", ""))
+                if reply_id:
+                    prev = self._pending_rag_text.get(reply_id, "")
+                    self._pending_rag_text[reply_id] = prev + content
         elif event == protocol.EVENT_TTS_SENTENCE_START:  # 350
             tts_type = payload.get("tts_type")
             if self._dropping_cloud_audio and tts_type in _RESUME_TTS_TYPES:
                 self._dropping_cloud_audio = False  # 注入内容的音频开始，恢复下发
             if self._dropping_cloud_text and tts_type == "external_rag":
                 self._dropping_cloud_text = False  # 原始 LLM 已结束，RAG 550 即将开始
+                # flush：350(external_rag) 到达前已缓冲的该 reply 文本现在可以放行
+                reply_id = str(payload.get("reply_id", ""))
+                if reply_id and reply_id in self._pending_rag_text:
+                    buffered = self._pending_rag_text.pop(reply_id)
+                    turn = self.rt.session.current_turn
+                    if turn is not None and buffered:
+                        turn.assistant_text += buffered
+                        for segment in self._segmenter.feed(buffered):
+                            await self._emit_sentence(segment)
+                self._pending_rag_text.clear()  # 其余非 rag reply 的缓冲丢弃
         elif event == protocol.EVENT_TTS_ENDED:  # 359 本轮音频播完
             self._reply_turn_id = None
             remainder = self._segmenter.flush()
@@ -192,6 +213,7 @@ class DoubaoRealtimeStage(Stage):
         self._sentence_emitted = False
         self._dropping_cloud_audio = False  # 每轮开始时重置：旧轮注入状态不污染新轮
         self._dropping_cloud_text = False
+        self._pending_rag_text.clear()
         text = self._asr_text.strip()
         if not text:
             self.rt.state_machine.cancel_turn()

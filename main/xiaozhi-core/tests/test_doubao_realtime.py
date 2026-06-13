@@ -485,6 +485,50 @@ def test_rag_injection_filters_cloud_550_text():
     asyncio.run(run())
 
 
+def test_rag_reply_550_before_350_external_rag_is_buffered_and_released():
+    """550 文本先于 350(external_rag) 到达时，应被缓冲并在 350 后 flush。"""
+
+    async def run() -> None:
+        client = FakeDoubaoClient(
+            [
+                full(450),
+                full(451, {"results": [{"text": "讲一个故事"}]}),
+                full(459),
+                # 服务端自答：350(default) + 550 → 丢弃
+                full(350, {"reply_id": "r1", "tts_type": "default"}),
+                full(550, {"reply_id": "r1", "content": "旧回复：从前有座山。"}),
+                full(559, {"reply_id": "r1"}),
+                # 新 reply 的 550 先于 350(external_rag) 到达 → 缓冲
+                full(550, {"reply_id": "r2", "content": "RAG首句，"}),
+                full(550, {"reply_id": "r2", "content": "来自记忆。"}),
+                # 350(external_rag) 后才到 → flush 缓冲
+                full(350, {"reply_id": "r2", "tts_type": "external_rag"}),
+                # 后续 550 正常通过
+                full(550, {"reply_id": "r2", "content": "更多内容。"}),
+                ack(b"AUDIO"),
+                full(359, {"reply_id": "r2"}),
+            ]
+        )
+        runtime, transport, _ = make_runtime(
+            client, memory=InMemoryMemory("用户记忆内容"), comfort_text=None
+        )
+        completed: list[TurnCompleted] = []
+        runtime.bus.subscribe(TurnCompleted, lambda e: completed.append(e))
+
+        await run_script(client, runtime)
+
+        assert completed, "应有轮次完成事件"
+        text = completed[0].assistant_text
+        assert "RAG首句" in text, f"缓冲的 RAG 首段文本应被 flush，实际: {text!r}"
+        assert "来自记忆" in text, f"缓冲的 RAG 第二段文本应被 flush，实际: {text!r}"
+        assert "更多内容" in text, f"350 后的 550 应正常通过，实际: {text!r}"
+        assert "旧回复" not in text, f"注入前的自答文本应被丢弃，实际: {text!r}"
+
+        await runtime.stop()
+
+    asyncio.run(run())
+
+
 def test_local_llm_uses_composer_and_memory():
     """照念分支：prompt 经 PromptComposer 拼装，记忆走 {memory} 占位符进本地 prompt。"""
 
