@@ -541,7 +541,7 @@ def test_rag_reply_550_before_350_external_rag_is_buffered_and_released():
                 full(359, {"reply_id": "r2"}),
             ]
         )
-        runtime, transport, _ = make_runtime(
+        runtime, _transport, _ = make_runtime(
             client, memory=InMemoryMemory("用户记忆内容"), comfort_text=None
         )
         completed: list[TurnCompleted] = []
