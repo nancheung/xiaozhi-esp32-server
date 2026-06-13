@@ -100,6 +100,8 @@ class DoubaoRealtimeStage(Stage):
         self._reply_turn_id: str | None = None
         # 注入（500/502）期间丢弃云端自答音频，直到 350(tts_type=chat_tts_text/external_rag)
         self._dropping_cloud_audio = False
+        # 注入期间丢弃云端原始 LLM 550 文本；502 发出后立即清零（音频/文本恢复时机不同）
+        self._dropping_cloud_text = False
         # 回复文本切句下发（AudioOutputStage 据此发 tts/sentence_start，与 LlmStage 同构）
         self._segmenter = SentenceSegmenter()
         self._sentence_emitted = False
@@ -157,7 +159,7 @@ class DoubaoRealtimeStage(Stage):
             await self._on_user_finished()
         elif event == protocol.EVENT_CHAT_RESPONSE:  # 550 云端 LLM 文本增量
             turn = self.rt.session.current_turn
-            if turn is not None and not self._use_local_llm and not self._dropping_cloud_audio:
+            if turn is not None and not self._use_local_llm and not self._dropping_cloud_text:
                 content = str(payload.get("content", ""))
                 turn.assistant_text += content
                 for segment in self._segmenter.feed(content):
@@ -184,6 +186,7 @@ class DoubaoRealtimeStage(Stage):
         self._segmenter.reset()
         self._sentence_emitted = False
         self._dropping_cloud_audio = False  # 每轮开始时重置：旧轮注入状态不污染新轮
+        self._dropping_cloud_text = False
         text = self._asr_text.strip()
         if not text:
             self.rt.state_machine.cancel_turn()
@@ -235,10 +238,13 @@ class DoubaoRealtimeStage(Stage):
 
     async def _memory_rag_inject(self, user_text: str) -> None:
         """知识注入分支（ChatRAGText 502）：记忆注入豆包，云端 LLM 重新生成润色。"""
+        self._dropping_cloud_audio = True  # 立即丢弃云端原始音频（等 350 事件恢复）
+        self._dropping_cloud_text = True   # 立即丢弃云端原始 LLM 文本（502 发出后恢复）
         memory_text = await self._query_memory(user_text)
         if not memory_text:
-            return  # 无相关记忆：保持纯端到端，不丢音频
-        self._dropping_cloud_audio = True
+            self._dropping_cloud_audio = False  # 无记忆：降级纯端到端，恢复放行
+            self._dropping_cloud_text = False
+            return
         if self._comfort_text:  # 安抚话术掩盖检索/重生成耗时（demo 同款两连发）
             await self._emit_sentence(self._comfort_text)
             await self._client.send_chat_tts_text(start=True, end=False, content=self._comfort_text)
@@ -248,6 +254,9 @@ class DoubaoRealtimeStage(Stage):
                 [{"title": "用户记忆", "content": memory_text}], ensure_ascii=False
             )
         )
+        # 502 已发出：原始 LLM 已被 500 停止，后续 550 均属 RAG LLM，立即恢复文本下发
+        # 音频仍由 _dropping_cloud_audio 控制，等 350(chat_tts_text/external_rag) 清零
+        self._dropping_cloud_text = False
 
     async def _on_audio(self, chunk: bytes) -> None:
         if not chunk or self._dropping_cloud_audio:

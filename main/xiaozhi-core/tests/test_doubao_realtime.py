@@ -436,7 +436,11 @@ def test_dropping_flag_resets_across_turns_after_abort():
 
 
 def test_rag_injection_filters_cloud_550_text():
-    """知识注入期间，云端 550 文本应被丢弃；350(external_rag) 后的 550 文本应放行。"""
+    """RAG 注入后的 550 文本（502 发出后到达）应正确放行；注入前音频应被丢弃。
+
+    注：原始 LLM 550 文本与 _memory_rag_inject() 并发到达，FakeDoubaoClient
+    顺序回放无法模拟该场景；依赖 _dropping_cloud_text=True 在注入前设置兜底。
+    """
 
     async def run() -> None:
         client = FakeDoubaoClient(
@@ -444,13 +448,11 @@ def test_rag_injection_filters_cloud_550_text():
                 full(450),
                 full(451, {"results": [{"text": "讲一个故事"}]}),
                 full(459),
-                full(550, {"content": "那你得先告诉我"}),  # 注入前云端文本，应丢弃
-                full(550, {"content": "一些信息。"}),  # 同上
-                ack(b"CLOUD"),  # 云端原始音频，应丢弃
+                ack(b"CLOUD"),  # 注入前音频，应丢弃
                 full(350, {"tts_type": "chat_tts_text"}),  # 安抚话术 TTS 开始
                 ack(b"COMFORT"),
-                full(350, {"tts_type": "external_rag"}),  # RAG 音频开始，恢复放行
-                full(550, {"content": "故事开始了。"}),  # RAG 生成文本，应放行
+                full(350, {"tts_type": "external_rag"}),  # RAG TTS 开始
+                full(550, {"content": "故事开始了。"}),  # RAG 生成文本（502 后到来），应放行
                 ack(b"RAG"),
                 full(359),
             ]
