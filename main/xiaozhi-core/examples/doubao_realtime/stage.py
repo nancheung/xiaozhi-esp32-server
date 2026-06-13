@@ -5,24 +5,37 @@
 
     Pipeline([DoubaoRealtimeStage(client), AudioOutputStage()])
 
-事件映射（豆包 -> core）：
+事件映射（豆包服务端 -> core）：
 
     450 ASRInfo      -> VoiceStarted（SPEAKING/THINKING 中收到 = 用户打断，先 AbortRequested）
-    451 ASRResponse  -> 暂存识别文本
+    451 ASRResponse  -> 暂存识别文本（is_interim=False 时记为最终结果）
     459 ASREnded     -> VoiceStopped（begin_turn）+ AsrFinalized；空文本静默取消
     SERVER_ACK 音频   -> TtsAudioChunkReady（首帧前补 on_speaking 转移，替代 TtsStage 职责）
-    359 TTSEnded     -> TtsSentenceSegmented(LAST) + TtsStopped（收束本轮）
-    550 ChatResponse -> 累积 turn.assistant_text（云端 LLM 模式）
+    350 TTS开始      -> 控制丢弃标志；flush 已缓冲的 RAG 文本（见下方"RAG 文本时序"说明）
+    351 TTS分句结束   -> 记录精确句子文本和音频时长（供日志和扩展）
+    359 TTSEnded     -> 仅在有 turn 时：TtsSentenceSegmented(LAST) + TtsStopped（收束本轮）
+    550 ChatResponse -> 累积 turn.assistant_text（云端 LLM 模式，丢弃期按 reply_id 暂存）
+    154 UsageResponse -> 记录 token 用量（info 日志）
+    150 SessionStarted -> 记录 dialog_id（供续接对话）
+    152/153 会话结束   -> info/error 日志
+    599 DialogCommonError -> error 日志
 
 入站方向：AudioFrameReceived 直通 ``client.send_audio()``（无本地 VAD/缓冲）。
 
-回复路径按 **装配期协商** 自动选择（对齐 core 理念：给了什么 adapter 就激活什么链路）：
+RAG 文本时序说明
+-----------------
+豆包服务端会在 350(external_rag) 到达*之前*就开始发送该句 550 文本，导致全局丢弃标志
+``_dropping_cloud_text`` 会误丢这些先行文本。修复方案：用 ``_pending_rag_text`` 字典
+（以 reply_id 为 key）暂存丢弃期内出现的"新 reply_id"550 文本，350(external_rag) 到达
+时按 reply_id flush 缓冲，保证 turn.assistant_text 的完整性。
+
+回复路径按装配期协商自动选择（对齐 core 理念：给了什么 adapter 就激活什么链路）：
 
 - ``use_local_llm=True``（照念分支，ChatTTSText 500）：本地 LLM 生成回复，豆包绕过云端
   LLM 仅做 TTS 照念。prompt 经 ``PromptComposer`` 拼装（与 LlmStage 同构），装配了
   ``MemoryPort`` 时记忆走 ``{memory}`` 占位符进本地 prompt。
 - ``use_local_llm=False`` 且装配了 ``MemoryPort``（知识注入分支，ChatRAGText 502）：
-  把 ``memory.query()`` 结果注入豆包，云端 LLM 据此**重新生成并润色**回答；可选先发
+  把 ``memory.query()`` 结果注入豆包，云端 LLM 据此重新生成并润色回答；可选先发
   ``comfort_text`` 安抚话术掩盖检索耗时。memory 未装配或查询为空 -> 自动降级纯端到端。
 
 两条注入路径期间丢弃豆包注入前的自答音频，直到 350 携带
