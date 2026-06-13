@@ -94,6 +94,7 @@ class DoubaoRealtimeStage(Stage):
         self._say_hello = say_hello
         self._receive_task: asyncio.Task[None] | None = None
         self._connected = False
+        self._dialog_id: str | None = None  # 服务端 150 返回，可用于续接对话
         self._asr_text = ""
         # 当前应答归属的轮次：打断后过滤豆包仍在下发的旧轮音频；None = 无轮次
         # 语境（如开场白），音频直接放行。
@@ -150,7 +151,12 @@ class DoubaoRealtimeStage(Stage):
 
         event = message.event
         payload = message.payload or {}
-        if event == protocol.EVENT_ASR_INFO:  # 450 用户开始说话
+        if event == protocol.EVENT_SESSION_STARTED:  # 150 服务端确认 session 建立
+            dialog_id = str(payload.get("dialog_id", ""))
+            if dialog_id:
+                self._dialog_id = dialog_id
+                logger.info("豆包 session 已建立，dialog_id=%s（可用于续接对话）", dialog_id)
+        elif event == protocol.EVENT_ASR_INFO:  # 450 用户开始说话
             if self.rt.state_machine.state in (DialogueState.SPEAKING, DialogueState.THINKING):
                 await self.rt.emit(AbortRequested())  # 用户打断：立即收束当前应答
             self._asr_text = ""
@@ -193,6 +199,29 @@ class DoubaoRealtimeStage(Stage):
                         for segment in self._segmenter.feed(buffered):
                             await self._emit_sentence(segment)
                 self._pending_rag_text.clear()  # 其余非 rag reply 的缓冲丢弃
+        elif event == protocol.EVENT_TTS_SENTENCE_END:  # 351 分句结束
+            turn = self.rt.session.current_turn
+            if turn is not None and not self._use_local_llm:
+                sentence_text = str(payload.get("text", ""))
+                duration = (payload.get("sentence_duration") or {}).get("sentence_end_time")
+                logger.debug(
+                    "豆包分句结束 reply_id=%s text=%r duration=%.3fs",
+                    payload.get("reply_id"),
+                    sentence_text,
+                    duration or 0.0,
+                )
+        elif event == protocol.EVENT_USAGE_RESPONSE:  # 154 token 用量统计
+            usage = payload.get("usage") or {}
+            logger.info(
+                "豆包 token 用量 | in_audio=%s in_text=%s out_audio=%s out_text=%s "
+                "cached_audio=%s cached_text=%s",
+                usage.get("input_audio_tokens", 0),
+                usage.get("input_text_tokens", 0),
+                usage.get("output_audio_tokens", 0),
+                usage.get("output_text_tokens", 0),
+                usage.get("cached_audio_tokens", 0),
+                usage.get("cached_text_tokens", 0),
+            )
         elif event == protocol.EVENT_TTS_ENDED:  # 359 本轮音频播完
             self._reply_turn_id = None
             self._pending_rag_text.clear()
@@ -211,8 +240,14 @@ class DoubaoRealtimeStage(Stage):
             if self._sentence_emitted:
                 await self.rt.emit(TtsSentenceSegmented(position=SentencePosition.LAST))
             await self.rt.emit(TtsStopped())
-        elif event in (protocol.EVENT_SESSION_FINISHED, protocol.EVENT_SESSION_FAILED):
-            logger.info("豆包会话结束 event=%s payload=%s", event, payload)
+        elif event == protocol.EVENT_SESSION_FINISHED:  # 152
+            logger.info("豆包会话正常结束")
+        elif event == protocol.EVENT_SESSION_FAILED:  # 153
+            logger.error("豆包会话失败 payload=%s", payload)
+        elif event == protocol.EVENT_DIALOG_COMMON_ERROR:  # 599
+            status_code = payload.get("status_code")
+            message_text = payload.get("message", "")
+            logger.error("豆包对话运行时错误 status_code=%s message=%s", status_code, message_text)
 
     async def _on_user_finished(self) -> None:
         await self.rt.emit(VoiceStopped())  # 状态机在此 begin_turn
