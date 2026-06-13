@@ -331,6 +331,25 @@ def test_say_hello_audio_passes_without_turn():
     asyncio.run(run())
 
 
+def test_say_hello_359_does_not_emit_tts_stopped():
+    """开场白流程（无 turn）收到 359 不应触发 TtsStopped（即不应有 tts:stop 协议消息）。"""
+
+    async def run():
+        client = FakeDoubaoClient([ack(b"HELLO_AUDIO"), full(359)])
+        runtime, transport, _ = make_runtime(client, say_hello="你好")
+        await run_script(client, runtime)
+
+        # TtsStopped → AudioOutputStage → tts:stop 协议消息；无 turn 时不应出现
+        stop_events = [m for m in transport.sent_events if m.get("state") == "stop"]
+        assert not stop_events, f"无 turn 时 359 不应触发 TtsStopped，实际: {stop_events}"
+        assert transport.sent_audio == [b"HELLO_AUDIO"]
+        assert runtime.state_machine.state is DialogueState.IDLE
+
+        await runtime.stop()
+
+    asyncio.run(run())
+
+
 def test_memory_rag_injection():
     """知识注入分支：记忆经 ChatRAGText(502) 注入，安抚话术先发，云端自答音频被丢弃。"""
 

@@ -195,14 +195,21 @@ class DoubaoRealtimeStage(Stage):
                 self._pending_rag_text.clear()  # 其余非 rag reply 的缓冲丢弃
         elif event == protocol.EVENT_TTS_ENDED:  # 359 本轮音频播完
             self._reply_turn_id = None
+            self._pending_rag_text.clear()
+            turn = self.rt.session.current_turn
+            if turn is None:
+                # 无轮次（如开场白 say_hello）：轻量清理，不触发状态机收束
+                self._segmenter.reset()
+                self._sentence_emitted = False
+                return
             remainder = self._segmenter.flush()
             if remainder:
                 await self._emit_sentence(remainder)
-            turn = self.rt.session.current_turn
-            if turn is not None and not self._use_local_llm and turn.assistant_text:
+            if not self._use_local_llm and turn.assistant_text:
                 # 云端回复落账历史（本地接管路径在 takeover 内落账）
                 self.rt.session.dialogue.put(Message(role="assistant", content=turn.assistant_text))
-            await self.rt.emit(TtsSentenceSegmented(position=SentencePosition.LAST))
+            if self._sentence_emitted:
+                await self.rt.emit(TtsSentenceSegmented(position=SentencePosition.LAST))
             await self.rt.emit(TtsStopped())
         elif event in (protocol.EVENT_SESSION_FINISHED, protocol.EVENT_SESSION_FAILED):
             logger.info("豆包会话结束 event=%s payload=%s", event, payload)
