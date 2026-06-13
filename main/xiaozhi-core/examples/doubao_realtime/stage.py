@@ -162,9 +162,11 @@ class DoubaoRealtimeStage(Stage):
             self._asr_text = ""
             await self.rt.emit(VoiceStarted())
         elif event == protocol.EVENT_ASR_RESPONSE:  # 451 识别文本（增量覆盖）
-            text = protocol.extract_asr_text(payload)
+            text, is_final = protocol.extract_asr_text(payload)
             if text:
                 self._asr_text = text
+                if is_final:
+                    logger.debug("ASR 最终识别结果: %r", text)
         elif event == protocol.EVENT_ASR_ENDED:  # 459 用户说完
             await self._on_user_finished()
         elif event == protocol.EVENT_CHAT_RESPONSE:  # 550 云端 LLM 文本增量

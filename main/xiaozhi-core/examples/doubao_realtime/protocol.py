@@ -171,11 +171,16 @@ def parse_server_message(data: bytes) -> ServerMessage:
     return ServerMessage(kind="unknown")
 
 
-def extract_asr_text(payload: dict[str, Any] | None) -> str:
-    """从 451 ASRResponse 容错提取识别文本（results[0].text）。"""
+def extract_asr_text(payload: dict[str, Any] | None) -> tuple[str, bool]:
+    """从 451 ASRResponse 提取识别文本和是否为最终结果。
+
+    Returns:
+        (text, is_final): is_final=True 表示 is_interim=False 的最终确认结果。
+    """
     if not payload:
-        return ""
+        return "", False
     results = payload.get("results")
     if isinstance(results, list) and results and isinstance(results[0], dict):
-        return str(results[0].get("text", ""))
-    return str(payload.get("text", ""))
+        r = results[0]
+        return str(r.get("text", "")), not r.get("is_interim", True)
+    return str(payload.get("text", "")), False

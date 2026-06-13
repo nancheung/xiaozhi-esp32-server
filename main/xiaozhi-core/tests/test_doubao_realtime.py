@@ -97,10 +97,23 @@ def test_marshal_event_payload_is_gzip_json():
 
 
 def test_extract_asr_text_variants():
-    assert protocol.extract_asr_text({"results": [{"text": "你好"}]}) == "你好"
-    assert protocol.extract_asr_text({"text": "直取"}) == "直取"
-    assert protocol.extract_asr_text({"results": []}) == ""
-    assert protocol.extract_asr_text(None) == ""
+    text, is_final = protocol.extract_asr_text({"results": [{"text": "你好", "is_interim": False}]})
+    assert text == "你好" and is_final is True
+
+    text, is_final = protocol.extract_asr_text({"results": [{"text": "中间", "is_interim": True}]})
+    assert text == "中间" and is_final is False
+
+    text, is_final = protocol.extract_asr_text({"results": [{"text": "无标志"}]})
+    assert text == "无标志" and is_final is False  # 默认 is_interim=True → is_final=False
+
+    text, is_final = protocol.extract_asr_text({"text": "直取"})
+    assert text == "直取" and is_final is False
+
+    text, is_final = protocol.extract_asr_text({"results": []})
+    assert text == "" and is_final is False
+
+    text, is_final = protocol.extract_asr_text(None)
+    assert text == "" and is_final is False
 
 
 # ---------------------------------------------------------------------------
