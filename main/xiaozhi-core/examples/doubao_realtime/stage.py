@@ -100,7 +100,8 @@ class DoubaoRealtimeStage(Stage):
         self._reply_turn_id: str | None = None
         # 注入（500/502）期间丢弃云端自答音频，直到 350(tts_type=chat_tts_text/external_rag)
         self._dropping_cloud_audio = False
-        # 注入期间丢弃云端原始 LLM 550 文本；502 发出后立即清零（音频/文本恢复时机不同）
+        # 注入期间丢弃云端原始 LLM 550 文本；350(external_rag) 到来时清零
+        # （350(external_rag) 晚于所有原始 LLM 550、早于所有 RAG LLM 550，是天然分隔点）
         self._dropping_cloud_text = False
         # 回复文本切句下发（AudioOutputStage 据此发 tts/sentence_start，与 LlmStage 同构）
         self._segmenter = SentenceSegmenter()
@@ -136,6 +137,7 @@ class DoubaoRealtimeStage(Stage):
             logger.exception("豆包接收循环异常退出，会话不再产出应答")
 
     async def _on_message(self, message: ServerMessage) -> None:
+        logger.debug("收到豆包消息：%s", message.to_dict())
         if message.kind == "error":
             raise RuntimeError(f"豆包服务端错误 code={message.code}: {message.payload}")
         if message.kind == "ack":
@@ -165,8 +167,11 @@ class DoubaoRealtimeStage(Stage):
                 for segment in self._segmenter.feed(content):
                     await self._emit_sentence(segment)
         elif event == protocol.EVENT_TTS_SENTENCE_START:  # 350
-            if self._dropping_cloud_audio and payload.get("tts_type") in _RESUME_TTS_TYPES:
+            tts_type = payload.get("tts_type")
+            if self._dropping_cloud_audio and tts_type in _RESUME_TTS_TYPES:
                 self._dropping_cloud_audio = False  # 注入内容的音频开始，恢复下发
+            if self._dropping_cloud_text and tts_type == "external_rag":
+                self._dropping_cloud_text = False  # 原始 LLM 已结束，RAG 550 即将开始
         elif event == protocol.EVENT_TTS_ENDED:  # 359 本轮音频播完
             self._reply_turn_id = None
             remainder = self._segmenter.flush()
@@ -254,9 +259,6 @@ class DoubaoRealtimeStage(Stage):
                 [{"title": "用户记忆", "content": memory_text}], ensure_ascii=False
             )
         )
-        # 502 已发出：原始 LLM 已被 500 停止，后续 550 均属 RAG LLM，立即恢复文本下发
-        # 音频仍由 _dropping_cloud_audio 控制，等 350(chat_tts_text/external_rag) 清零
-        self._dropping_cloud_text = False
 
     async def _on_audio(self, chunk: bytes) -> None:
         if not chunk or self._dropping_cloud_audio:

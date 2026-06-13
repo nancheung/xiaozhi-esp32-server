@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import gzip
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 PROTOCOL_VERSION = 0b0001
@@ -55,6 +55,7 @@ EVENT_ASR_INFO = 450  # 用户开始说话（SPEAKING 中收到即打断信号�
 EVENT_ASR_RESPONSE = 451  # ASR 识别文本（增量覆盖）
 EVENT_ASR_ENDED = 459  # 用户说话结束
 EVENT_CHAT_RESPONSE = 550  # 云端 LLM 文本增量
+EVENT_CHAT_ENDED = 559     # 云端 LLM 文本生成结束
 
 
 def encode_frame(
@@ -118,7 +119,11 @@ class ServerMessage:
     audio: bytes | None = None
     code: int | None = None
 
-
+    def to_dict(self, *, exclude_audio: bool = True):
+        d = asdict(self)
+        if exclude_audio:
+            d.pop("audio", None)
+        return d
 def parse_server_message(data: bytes) -> ServerMessage:
     """解一帧服务端消息。未知消息类型返回 kind="unknown"（调用方丢弃）。"""
     header_size = data[0] & 0x0F

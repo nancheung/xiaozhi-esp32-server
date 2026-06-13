@@ -436,10 +436,10 @@ def test_dropping_flag_resets_across_turns_after_abort():
 
 
 def test_rag_injection_filters_cloud_550_text():
-    """RAG 注入后的 550 文本（502 发出后到达）应正确放行；注入前音频应被丢弃。
+    """原始 LLM 550 在 350(external_rag) 前到达被丢弃；RAG LLM 550 在之后到达并展示。
 
-    注：原始 LLM 550 文本与 _memory_rag_inject() 并发到达，FakeDoubaoClient
-    顺序回放无法模拟该场景；依赖 _dropping_cloud_text=True 在注入前设置兜底。
+    模拟真实时序：_receive_loop 在 459 链路期间挂起，原始 LLM 550 帧堆积于 WebSocket
+    缓冲区；脚本将原始 550 置于 459 之后、350(external_rag) 之前，验证文本门持续有效。
     """
 
     async def run() -> None:
@@ -448,12 +448,18 @@ def test_rag_injection_filters_cloud_550_text():
                 full(450),
                 full(451, {"results": [{"text": "讲一个故事"}]}),
                 full(459),
-                ack(b"CLOUD"),  # 注入前音频，应丢弃
-                full(350, {"tts_type": "chat_tts_text"}),  # 安抚话术 TTS 开始
+                # 459 处理后 _dropping_cloud_text=True（修复后持续保持直到 external_rag）；
+                # 以下原始 LLM 550 应被门控丢弃
+                full(550, {"content": "原始：从前有座山。", "reply_id": "reply_a"}),
+                full(550, {"content": "原始：山里有座庙。", "reply_id": "reply_a"}),
+                full(protocol.EVENT_CHAT_ENDED, {"reply_id": "reply_a"}),  # 559，仅过序
+                ack(b"CLOUD_AUDIO"),  # 原始 LLM 音频，应丢弃
+                full(350, {"tts_type": "chat_tts_text"}),  # 安抚话术音频门清零
                 ack(b"COMFORT"),
-                full(350, {"tts_type": "external_rag"}),  # RAG TTS 开始
-                full(550, {"content": "故事开始了。"}),  # RAG 生成文本（502 后到来），应放行
-                ack(b"RAG"),
+                full(350, {"tts_type": "external_rag"}),  # 精确分隔点：清文本门+音频门
+                # 门已开，RAG LLM 550 正常放行
+                full(550, {"content": "RAG：很久以前有一只小猫。", "reply_id": "reply_b"}),
+                ack(b"RAG_AUDIO"),
                 full(359),
             ]
         )
@@ -463,8 +469,17 @@ def test_rag_injection_filters_cloud_550_text():
         await run_script(client, runtime)
 
         sentences = [m["text"] for m in transport.sent_events if m.get("state") == "sentence_start"]
-        assert sentences == ["稍等。", "故事开始了。"]
-        assert transport.sent_audio == [b"COMFORT", b"RAG"]
+        # 原始 LLM 内容不得出现
+        assert all("原始" not in s for s in sentences), f"原始 LLM 文本泄漏: {sentences}"
+        # 安抚话术正常出现
+        assert sentences[0] == "稍等。"
+        # RAG 内容通过 550 正常展示
+        combined = "".join(sentences)
+        assert "很久以前" in combined and "小猫" in combined
+        # 音频：原始音频丢弃，COMFORT 与 RAG 音频放行
+        assert b"CLOUD_AUDIO" not in transport.sent_audio
+        assert b"COMFORT" in transport.sent_audio
+        assert b"RAG_AUDIO" in transport.sent_audio
         await runtime.stop()
 
     asyncio.run(run())
