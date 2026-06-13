@@ -153,7 +153,6 @@ class DoubaoRealtimeStage(Stage):
             logger.exception("豆包接收循环异常退出，会话不再产出应答")
 
     async def _on_message(self, message: ServerMessage) -> None:
-        logger.info("收到豆包消息：%s", message.to_dict())
         if message.kind == "error":
             raise RuntimeError(f"豆包服务端错误 code={message.code}: {message.payload}")
         if message.kind == "ack":

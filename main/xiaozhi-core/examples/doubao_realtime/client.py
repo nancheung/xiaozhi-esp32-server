@@ -29,6 +29,28 @@ class DoubaoRealtimeClient:
         self.session_id = str(uuid.uuid4())
         self._ws: Any = None
 
+    # ---- 统一收发口子 --------------------------------------------------------
+
+    async def _send_event(
+        self, event: int, payload: dict[str, Any], *, session_id: str | None = None
+    ) -> None:
+        logger.info(
+            "[发出豆包消息]：%s",
+            {"event": event, "session_id": session_id, "payload": payload},
+        )
+        await self._ws.send(protocol.marshal_event(event, payload, session_id=session_id))
+
+    async def _send_audio(self, pcm: bytes) -> None:
+        logger.debug("[发出豆包音频]：%d bytes", len(pcm))
+        await self._ws.send(protocol.marshal_audio(self.session_id, pcm))
+
+    async def _recv_one(self) -> ServerMessage:
+        msg = protocol.parse_server_message(await self._ws.recv())
+        logger.info("[收到豆包消息]：%s", msg.to_dict())
+        return msg
+
+    # ---- 公开接口 ------------------------------------------------------------
+
     async def connect(self) -> None:
         """建连 -> StartConnection(1) -> StartSession(100)。"""
         import websockets
@@ -48,46 +70,36 @@ class DoubaoRealtimeClient:
                 self._ws_config["base_url"], extra_headers=headers, ping_interval=None
             )
 
-        await self._ws.send(protocol.marshal_event(protocol.EVENT_START_CONNECTION, {}))
-        reply = protocol.parse_server_message(await self._ws.recv())
-        logger.info("StartConnection 响应: %s", reply)
+        await self._send_event(protocol.EVENT_START_CONNECTION, {})
+        await self._recv_one()
 
-        await self._ws.send(
-            protocol.marshal_event(
-                protocol.EVENT_START_SESSION, self._session_req, session_id=self.session_id
-            )
+        await self._send_event(
+            protocol.EVENT_START_SESSION, self._session_req, session_id=self.session_id
         )
-        reply = protocol.parse_server_message(await self._ws.recv())
-        logger.info("StartSession 响应: %s", reply)
+        await self._recv_one()
 
     async def say_hello(self, content: str) -> None:
-        await self._ws.send(
-            protocol.marshal_event(
-                protocol.EVENT_SAY_HELLO, {"content": content}, session_id=self.session_id
-            )
+        await self._send_event(
+            protocol.EVENT_SAY_HELLO, {"content": content}, session_id=self.session_id
         )
 
     async def send_audio(self, pcm: bytes) -> None:
-        await self._ws.send(protocol.marshal_audio(self.session_id, pcm))
+        await self._send_audio(pcm)
 
     async def send_chat_tts_text(self, *, start: bool, end: bool, content: str) -> None:
         """event 500 ChatTTSText：注入机器人回复文本，由豆包仅做 TTS 播报。"""
-        await self._ws.send(
-            protocol.marshal_event(
-                protocol.EVENT_CHAT_TTS_TEXT,
-                {"start": start, "end": end, "content": content},
-                session_id=self.session_id,
-            )
+        await self._send_event(
+            protocol.EVENT_CHAT_TTS_TEXT,
+            {"start": start, "end": end, "content": content},
+            session_id=self.session_id,
         )
 
     async def send_chat_rag_text(self, *, external_rag: str) -> None:
         """event 502 ChatRAGText：注入外部知识，豆包云端 LLM 据此重新生成润色回答。"""
-        await self._ws.send(
-            protocol.marshal_event(
-                protocol.EVENT_CHAT_RAG_TEXT,
-                {"external_rag": external_rag},
-                session_id=self.session_id,
-            )
+        await self._send_event(
+            protocol.EVENT_CHAT_RAG_TEXT,
+            {"external_rag": external_rag},
+            session_id=self.session_id,
         )
 
     async def messages(self) -> AsyncIterator[ServerMessage]:
@@ -102,19 +114,19 @@ class DoubaoRealtimeClient:
             if isinstance(data, str):
                 logger.debug("忽略文本帧: %s", data)
                 continue
-            yield protocol.parse_server_message(data)
+            msg = protocol.parse_server_message(data)
+            logger.info("[收到豆包消息]：%s", msg.to_dict())
+            yield msg
 
     async def close(self) -> None:
         """FinishSession(102) -> FinishConnection(2) -> 关闭 WS。容忍连接已断。"""
         if self._ws is None:
             return
         try:
-            await self._ws.send(
-                protocol.marshal_event(
-                    protocol.EVENT_FINISH_SESSION, {}, session_id=self.session_id
-                )
+            await self._send_event(
+                protocol.EVENT_FINISH_SESSION, {}, session_id=self.session_id
             )
-            await self._ws.send(protocol.marshal_event(protocol.EVENT_FINISH_CONNECTION, {}))
+            await self._send_event(protocol.EVENT_FINISH_CONNECTION, {})
         except Exception as exc:
             logger.debug("关闭握手未完成（连接可能已断）: %s", exc)
         await self._ws.close()

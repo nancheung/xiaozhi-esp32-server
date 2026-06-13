@@ -125,9 +125,13 @@ class ServerMessage:
 
     def to_dict(self, *, exclude_audio: bool = True):
         d = asdict(self)
-        if exclude_audio:
-            d.pop("audio", None)
+
+        audio = d.get("audio")
+        if audio is not None and exclude_audio:
+            d["audio"] = f"<bytes {len(d["audio"])}>"
         return d
+
+
 def parse_server_message(data: bytes) -> ServerMessage:
     """解一帧服务端消息。未知消息类型返回 kind="unknown"（调用方丢弃）。"""
     header_size = data[0] & 0x0F
